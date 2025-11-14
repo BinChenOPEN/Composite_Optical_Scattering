@@ -1,0 +1,312 @@
+close all, clear all, clc,warning off;
+%% Parameter setting
+
+MATERIAL = 'TW'; % Choose between 'TW' (Transparent wood) and 'WFN' (Wood Fiber Network)
+switch MATERIAL
+    case 'TW'
+        folder = 'TW'; % Folder for the volume image and cell wall
+        folder_save = fullfile(folder,'Results'); % Save the ray tracing results
+
+        RawImg_File = fullfile(folder,'cellwall.mat'); % The sample folder
+        Volume = load(RawImg_File);
+        RawImg = Volume.cell_wall;
+        step_SCALE  = 2; % In ray tracing, each time the ray move for 1 voxels. 
+            % Choose a larger value when the geometrical feature is larger
+            % Here use 1 for WFN and 2 for TW
+    case 'WFN'
+        folder = 'Sample_pi_16'; % Folder for the volume image and cell wall
+        % folder = 'Sample_random'; % Folder for the volume image and cell wall
+        folder_save = fullfile(folder,'Results'); % Save the ray tracing results
+
+        RawImg_File = fullfile(folder,'volum_compress_solid_center_new.mat'); % The sample folder
+        Volume = load(RawImg_File);
+        RawImg = Volume.volum_compress_solid_center_new;
+        RawImg = permute(RawImg,[1,3,2]); % The volume needs to be rotated
+        step_SCALE  = 1; % In ray tracing, each time the ray move for 1 voxels. 
+            % Choose a larger value when the geometrical feature is larger
+            % Here use 1 for WFN and 2 for TW
+end
+
+n_Fiber = 1.52; % The refractive index of the matrix, the voxel value of 1
+n_Matrix = 1.54; % The refractive index of polymer, the voxel value of 0
+num_Ray = 1000; % How many rays do we need to simulate
+RandomRegionSize = 300; % The region where the incident rays will randomly distributed. Unit of voxels
+save_gif = 1; % set to 1 or 0 to save the 3D ray path or not.
+
+mkdir(folder_save)
+%% Ray tracing
+% volumSize = size(Volume.volum_compress_solid_center_new);
+clear Volume;
+% clear Volume;
+volume_Raytracing_size = size(RawImg);
+
+%% Study different rafractive index
+% Initialize same data
+indxPassThrough = zeros(num_Ray,1); % Incicator to show which ray will pass through the sample
+n_refall = zeros(num_Ray,3); % The output direction vector for the final ray
+offset_refall = zeros(num_Ray,3); % Save the offset of the ray after passing through the sample
+%% trace each ray. There are in total num_Ray needing to be tracked
+for t = 1:num_Ray
+    num_TotReflection = 0; % track how many total total reflection
+    % Gnerate a group of rays in size a small region. The size is
+    % 500 by 500 pixels
+    x_rand = RandomRegionSize*rand(1)-RandomRegionSize/2+volume_Raytracing_size(1)/2;
+    z_rand = RandomRegionSize*rand(1)-RandomRegionSize/2+volume_Raytracing_size(3)/2;
+
+    p0     = [x_rand;1;z_rand]; % The location of the incident point
+    n      = [0;1;0]; % The normal vector of the incident ray
+    p1     = p0 + step_SCALE*n; % The first point in the structure
+
+    stop_iter = 0;
+    iPoint = 0;
+    p_all = [];
+    n_all = [];
+    %% trace a single ray. It moves for 2 voxels at each step
+    % volume_Raytracing_size(2)+10 is a large value
+    while stop_iter == 0 && iPoint<3*volume_Raytracing_size(2)
+
+        iPoint = iPoint+1;
+        % The position of current point is inside the volume
+        if p1(1) < volume_Raytracing_size(1) && p1(2) < volume_Raytracing_size(2)...
+                && p1(3) < volume_Raytracing_size(3) && min(p1)>=1
+
+            % check the current position and the former position
+            % are in the same optical media or not
+            p0Integral = ceil(p0);
+            p1Integral = ceil(p1);
+            NoInterface = RawImg(p0Integral(1),p0Integral(2),p0Integral(3))...
+                ==RawImg(p1Integral(1),p1Integral(2),p1Integral(3));
+            if NoInterface
+                % if no interface exists, the ray moves forward
+                % along the original direciton
+                p0 = p1;
+                p1 = p1+step_SCALE*n;
+                n_all(iPoint,:) = n;
+                p_all(iPoint,:) = p0;
+            else
+                % interface exists
+                % The middle point pMiddle between the two positions is
+                % assumed as the intersection point
+                point = (p0+p1)/2;
+                pMiddle = round(point);
+
+                % a small region centering at the middle point is
+                % selected. The size is 6*6*6. It can be different
+                % but can not be too large or too small
+                subregX = max(1,-2+pMiddle(1)):min(3+pMiddle(1),volume_Raytracing_size(1));
+                subregY = max(1,-2+pMiddle(2)):min(3+pMiddle(2),volume_Raytracing_size(2));
+                subregZ = max(1,-2+pMiddle(3)):min(3+pMiddle(3),volume_Raytracing_size(3));
+                [x_grid, y_grid, z_grid] = ndgrid(subregX,subregY,subregZ);
+                subreg = RawImg(subregX,subregY,subregZ);
+                indy = find(subregY-pMiddle(2)==0);
+                indx = find(subregX-pMiddle(1)==0);
+                indz = find(subregZ-pMiddle(3)==0);
+                point_sub_volume = [indx + point(1)-subregX(indx),...
+                    indy + point(2) - subregY(indy),...
+                    indz + point(3) - subregZ(indz)];
+
+
+                outVol = isolateRegionSubvoxel(subreg, point_sub_volume, 6);
+
+                % subreg = double(subreg);
+                % subreg(subreg>=128) = 255;
+                % subreg(subreg<128) = 0;
+
+                % Use support vector machine to calculte the
+                % interface.
+                Md1 = fitcsvm([x_grid(:),y_grid(:),z_grid(:)],outVol(:),'KernelFunction','linear');
+                K   = [Md1.Beta;Md1.Bias]./norm(Md1.Beta);
+
+                if isnan(K(1)) || isnan(K(2)) || isnan(K(3))
+                    % If error happened, let the ray move forward
+                    % as usual. Of course, we don't hope this
+                    % happen
+                    n_interface = n;
+                else
+                    % Normalize the normal vector of the interface
+                    n_interface = K(1:3)/norm(K(1:3));
+                end
+
+                %% calculate the refracted or reflected ray
+                % The incident angle
+                angle_incidence = acos(sum(n.*n_interface));
+                if angle_incidence<pi/2
+                    n_interface     = -n_interface;
+                    angle_incidence = angle_incidence;
+                else
+                    n_interface     = n_interface;
+                    angle_incidence = pi-angle_incidence;
+                end
+
+                % Check if point p0 is in cell wall.
+                if RawImg(floor(p0(1)),floor(p0(2)),floor(p0(3))) == 1
+                    n1 = n_Fiber;
+                    n2 = n_Matrix;
+                else
+                    n1 = n_Matrix;
+                    n2 = n_Fiber;
+                end
+                % Calculate the refracted ray ortientation vector.
+                [n_refraction,isTotRef] = refraction(angle_incidence,n,n_interface,n1,n2);
+                num_TotReflection = num_TotReflection+isTotRef;
+
+                % update the normal vector and point
+                n_all(iPoint,:) = n;
+                p_all(iPoint,:) = point;
+
+                % the ray should move forward after refraction
+                p1 = point+max(0,(step_SCALE-norm(point-p0)))*n_refraction;
+
+                % Update the calculation point
+                iPoint = iPoint+1;
+                n = n_refraction;
+                p0 = p1;
+                p1 = p1+step_SCALE*n;
+            end
+
+        else
+            % If a ray goes outside the volume
+            if 1
+                if p0(2)>volume_Raytracing_size(2)
+                    % Continue to move forward for 100 voxels. The
+                    % aim is to better see the emergent ray
+                    point = p0;
+                    p1 = point+100*n;
+                else
+                    % From sample to air
+                    if p1(2)> volume_Raytracing_size(2)
+                        % if p0 is in the structure, p1 is in the
+                        % air, we need to calculate the reflection.
+                        indMax = 2;
+                        point = p0 + (volume_Raytracing_size(2)-p0(indMax))*n/n(2);
+                        n_interface = zeros(3,1);
+                        n_interface(indMax) = -1;
+                        if indMax == 2
+                            indxPassThrough(t) = 1;
+                        end
+                    end
+                    if p1(1)> volume_Raytracing_size(1)
+                        % if p0 is in the structure, p1 is in the
+                        % air, we need to calculate the reflection.
+                        indMax = 1;
+                        point = p0 + (volume_Raytracing_size(1)-p0(indMax))*n/n(1);
+                        n_interface = zeros(3,1);
+                        n_interface(indMax) = -1;
+                        if indMax == 1
+                            indxPassThrough(t) = 0;
+                        end
+                    end
+                    if p1(3)> volume_Raytracing_size(3)
+                        % if p0 is in the structure, p1 is in the
+                        % air, we need to calculate the reflection.
+                        indMax = 3;
+                        point = p0 + (volume_Raytracing_size(1)-p0(indMax))*n/n(1);
+                        n_interface = zeros(3,1);
+                        n_interface(indMax) = -1;
+                        if indMax == 3
+                            indxPassThrough(t) = 0;
+                        end
+                    end
+                    if min(p1)< 1
+                        indMin = find(p1 == min(p1));
+                        point = p0 + (1-p0(indMin))*n/n(indMin);
+                        n_interface = zeros(3,1);
+                        n_interface(indMin) = 1;
+                    end
+
+                    % calculate the reflection and refraction
+                    angle_incidence = acos(sum(n.*n_interface));
+                    if RawImg(floor(p0(1)),floor(p0(2)),floor(p0(3))) == 1
+                        n1 = n_Fiber;
+                    else
+                        n1 = n_Matrix;
+                    end
+                    n2 = 1;
+                    n_refraction = refraction(angle_incidence,n,n_interface,n1,n2);
+                    p0 = point;
+                    n  = n_refraction;
+                    p1 = point+100*n;
+                end
+
+            end
+
+            offset_refall(t,:) = point-[x_rand;1;z_rand];
+            stop_iter     = 1;
+        end
+        n_refall(t,:) = n;
+        p_all(iPoint,:) = p1;
+        n_all(iPoint,:) = n;
+    end
+
+    % Check if the ray will goes out from the opposite plane
+    if p_all(end,2)<= volume_Raytracing_size(2)
+        % if the ray does not go out from the opposite plane
+        n_refall(t,:) = [0,0,0];
+    else        
+        % Otherwise, we need to plot the light path
+        hold on,
+        plot3(p_all(:,1),p_all(:,2),p_all(:,3))
+        axis equal,
+    end
+    num_TotRef_all(t) = num_TotReflection;
+end
+
+
+%% save the gif for light path in 3D space
+if save_gif
+    filename = ['light_path','.gif'];
+    save_gif_file = fullfile(folder_save,filename);
+    axis equal
+    set(gcf,'color','w')
+    box on
+    xlabel('X (pixel)'), ylabel('Y (pixel)'), zlabel('Z (pixel)');
+    axis off;
+    axis tight
+    j = 1;
+    s = 0:2:360;
+    for j = 2:length(s)
+        view(-115-s(j),40);
+        pause(0.1)
+        frame = getframe(1);
+        im = frame2im(frame);
+        [imind,cm] = rgb2ind(im,256);
+        if j == 2
+            imwrite(imind,cm,save_gif_file,'gif','DelayTime',0.05, 'Loopcount',inf);
+        else
+            imwrite(imind,cm,save_gif_file,'gif','DelayTime',0.05,'WriteMode','append');
+        end
+    end
+
+end
+
+%% after the calculation of each ray
+if 1
+    Norm_n_refall = sum(n_refall.^2,2);
+    n_Effective = n_refall(find((Norm_n_refall>0) & (indxPassThrough == 1)),[1:3]);
+    % Calculate the angle along x direction
+    Angle_x = atan(n_Effective(:,1)./n_Effective(:,2));
+    % Calculate the angle along z direction
+    Angle_z = atan(n_Effective(:,3)./n_Effective(:,2));
+end
+Haze_x = length(find(abs(Angle_x*180/pi)>=2.5))/length(Angle_x)*100
+Haze_z = length(find(abs(Angle_z*180/pi)>=2.5))/length(Angle_z)*100
+
+
+% Export data as a structure format
+Params.num_TotRef    = num_TotRef_all; % number of totoal reflection
+Params.n_refall      = n_refall; 
+Params.offset_refall = offset_refall; % The offset of the ray
+Params.Angle_x       = Angle_x;
+Params.Angle_z       = Angle_z;
+Params.n_Matrix      = n_Matrix;
+Params.n_Fiber       = n_Fiber;
+Params.Haze_x        = Haze_x;
+Params.Haze_z        = Haze_z;
+% close all,
+% Save the data
+saveData = fullfile(folder_save,['Params_n_matrix_',num2str(n_Fiber),'_n_fiber_',num2str(n_Matrix),'.mat']);
+save(saveData,'Params')
+
+
+
+
